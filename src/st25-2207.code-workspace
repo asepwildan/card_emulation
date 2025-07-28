@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../repository/platformio/asep/st25-2207"
+		},
+		{
+			"name": "st25-2207",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
