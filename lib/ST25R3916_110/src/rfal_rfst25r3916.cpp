@@ -3373,6 +3373,8 @@ ReturnCode RfalRfST25R3916Class::rfalRunListenModeWorker(void)
   Serial.print("DEVICE STATE: ");
   Serial.println(gRFAL.Lm.state);
 
+  extern void onDeviceStateChange(int newState);
+onDeviceStateChange(gRFAL.Lm.state);
   switch (gRFAL.Lm.state) {
     /*******************************************************************************/
     case RFAL_LM_STATE_POWER_OFF:
@@ -3674,4 +3676,10 @@ ReturnCode RfalRfST25R3916Class::rfalRunListenModeWorker(void)
       return ERR_WRONG_STATE;
   }
   return ERR_NONE;
+}
+int RfalRfST25R3916Class::getDeviceState() {
+    if (gRFAL.state == RFAL_STATE_LM) {
+        return gRFAL.Lm.state;
+    }
+    return -1;  // Invalid state
 }

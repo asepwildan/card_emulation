@@ -442,6 +442,7 @@ class RfalRfST25R3916Class : public RfalRfClass {
     bool rfalWakeUpModeHasWoke(void);
     ReturnCode rfalWakeUpModeStop(void);
     ReturnCode rfalRunListenModeWorker(void);
+    int getDeviceState();
 
 
     /*
