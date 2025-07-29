@@ -18,7 +18,7 @@ void restartDiscovery();
 const char* rfalNfcState2Str(rfalNfcState st);
 ReturnCode demoTransceiveBlocking(uint8_t* txBuf, uint16_t txBufSize, uint8_t** rxData, uint16_t** rcvLen, uint32_t fwt);
 
-// STEP 2: HID OMNIKEY Card Reading - MINIMAL RISK INTEGRATION
+// HID OMNIKEY Card Reading Configuration
 #define RXD2 16
 #define TXD2 17
 
@@ -29,36 +29,97 @@ const byte COMMAND_READ_CSN[] = {
     0x00, 0x47, 0x09, 0x7E
 };
 
+// ESP32 SPI pin configuration
+const int kPinMOSI = 23;
+const int kPinMISO = 19;
+const int kPinSCK = 18;
+const int kPinSS = 5;
+const int kPinIRQ = -1;    // DISABLED for HID OMNIKEY compatibility
+const int kPinLED = 2;
+
+// Use VSPI peripheral for SPI communication on ESP32
+SPIClass gSPI(VSPI);
+
+// Hardware and NFC Layer
+RfalRfST25R3916Class gReaderHardware(&gSPI, kPinSS, kPinIRQ);
+RfalNfcClass gNFCReader(&gReaderHardware);
+
+// Card Emulation Configuration
+#define DEMO_LM_SEL_RES 0x20U
+#define DEMO_LM_NFCID2_BYTE1 0x02U
+
+// Proper initialization arrays
+static uint8_t ceNFCF_nfcid2[] = {DEMO_LM_NFCID2_BYTE1, 0xFE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+static uint8_t ceNFCA_SENS_RES[] = {0x04, 0x00};
+static uint8_t ceNFCA_NFCID[] = {0x08, 'S', 'T', 'M'}; // Custom UID: 08STM
+static uint8_t ceNFCA_SEL_RES = DEMO_LM_SEL_RES;
+
+static uint8_t NFCID3[] = {0x01, 0xFE, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A};
+static uint8_t GB[] = {0x46, 0x66, 0x6d, 0x01, 0x01, 0x11, 0x02, 0x02, 0x07, 0x80, 
+                       0x03, 0x02, 0x00, 0x03, 0x04, 0x01, 0x32, 0x07, 0x01, 0x03};
+
+// System State Variables
+bool systemInitialized = false;
+bool discoveryActive = false;
+bool cardActivated = false;
+bool emulationRequested = false;
+unsigned long lastActivity = 0;
+unsigned long cardEmulationStartTime = 0;
+const unsigned long DISCOVERY_RESTART_INTERVAL = 1000;
+uint8_t consecutiveErrors = 0;
+const uint8_t MAX_CONSECUTIVE_ERRORS = 3;
+
+// HID OMNIKEY Card Reading Variables
 byte responseBuffer[128];
 bool isCardPresent = false;
 String currentCardUID = "";
 unsigned long lastPollTime = 0;
-const unsigned long POLL_INTERVAL = 500; // INCREASED to 500ms for safety
-bool cardReadingEnabled = true; // Flag to enable/disable card reading
-bool systemInitialized = false;
-bool discoveryActive = false;
-// State management variables - MANUAL TRIGGER MODE
-unsigned long lastActivity = 0;
-unsigned long cardEmulationStartTime = 0;
-const unsigned long DISCOVERY_RESTART_INTERVAL = 1000; // 1 second for quick restart
-uint8_t consecutiveErrors = 0;
-const uint8_t MAX_CONSECUTIVE_ERRORS = 3;
+const unsigned long POLL_INTERVAL = 500;
+bool cardReadingEnabled = true;
 
-// TIMING DEBUG: Variables for measuring emulation start time
+// PHASE 2: Auto-Stop Logic Variables
+String detectedCardUID = "";
+bool autoEmulationTriggered = false;
+const unsigned long AUTO_STOP_TIMEOUT = 4000; // 4 seconds auto-stop
+unsigned long emulationAutoStartTime = 0;
+bool cardRemovedDuringEmulation = false;
+
+// TIMING DEBUG Variables
 unsigned long emulationStartTime = 0;
 unsigned long state2AchievedTime = 0;
 bool timingDebugActive = false;
 int lastDeviceState = -1;
 bool state2Detected = false;
-int state2Count = 0;  // Counter for device state 2 occurrences
-const int STATE2_TARGET_COUNT = 10;  // Stop timer after 10 occurrences
+int state2Count = 0;
+const int STATE2_TARGET_COUNT = 10;
 
+// Performance optimization flags
+bool skipHeartbeat = false;
+unsigned long lastWorkerCall = 0;
+const unsigned long WORKER_INTERVAL = 1;
 
-bool cardActivated = false;
-bool emulationRequested = false; // Manual trigger flag
+// Helper function to convert RFAL NFC state enum to string
+const char* rfalNfcState2Str(rfalNfcState st) {
+    switch (st) {
+        case RFAL_NFC_STATE_NOTINIT: return "NOTINIT";
+        case RFAL_NFC_STATE_START_DISCOVERY: return "START_DISCOVERY";
+        case RFAL_NFC_STATE_WAKEUP_MODE: return "WAKEUP_MODE";
+        case RFAL_NFC_STATE_POLL_TECHDETECT: return "POLL_TECHDETECT";
+        case RFAL_NFC_STATE_POLL_COLAVOIDANCE: return "POLL_COLAVOIDANCE";
+        case RFAL_NFC_STATE_POLL_SELECT: return "POLL_SELECT";
+        case RFAL_NFC_STATE_POLL_ACTIVATION: return "POLL_ACTIVATION";
+        case RFAL_NFC_STATE_LISTEN_TECHDETECT: return "LISTEN_TECHDETECT";
+        case RFAL_NFC_STATE_LISTEN_COLAVOIDANCE: return "LISTEN_COLAVOIDANCE";
+        case RFAL_NFC_STATE_LISTEN_ACTIVATION: return "LISTEN_ACTIVATION";
+        case RFAL_NFC_STATE_LISTEN_SLEEP: return "LISTEN_SLEEP";
+        case RFAL_NFC_STATE_ACTIVATED: return "ACTIVATED";
+        case RFAL_NFC_STATE_DATAEXCHANGE: return "DATAEXCHANGE";
+        case RFAL_NFC_STATE_DATAEXCHANGE_DONE: return "DATAEXCHANGE_DONE";
+        default: return "UNKNOWN";
+    }
+}
 
-// ESP32 SPI pin configuration - OPTIMIZED
-const int kPinMOSI = 23;
+// Extract UID from HID Omnikey response
 String extractCardUID(byte *data, int dataLength) {
     const int PAYLOAD_START_OFFSET = 12;
     const int MINIMUM_RESPONSE_LENGTH = 18;
@@ -90,7 +151,7 @@ String extractCardUID(byte *data, int dataLength) {
     return cardUID.length() > 0 ? cardUID : "";
 }
 
-// STEP 2: Check if response indicates error
+// Check if response indicates error
 bool isErrorResponse(byte *data, int dataLength) {
     const int MINIMUM_SUCCESS_LENGTH = 18;
     if (dataLength < MINIMUM_SUCCESS_LENGTH) return true;
@@ -103,10 +164,6 @@ bool isErrorResponse(byte *data, int dataLength) {
     return true;
 }
 
-// PHASE 1: UID Detection → Auto-Start Emulation
-String detectedCardUID = "";
-bool autoEmulationTriggered = false;
-
 // TIMING DEBUG: Start timing measurement
 void startTimingDebug() {
     emulationStartTime = millis();
@@ -114,130 +171,12 @@ void startTimingDebug() {
     timingDebugActive = true;
     lastDeviceState = -1;
     state2Detected = false;
-    state2Count = 0;  // Reset counter
+    state2Count = 0;
     Serial.printf("TIMING DEBUG: Started at %lu ms (waiting for %d x State 2)\n", 
                   emulationStartTime, STATE2_TARGET_COUNT);
 }
-// RADICAL FIX: Completely bypass restart mechanism
-void startCardEmulation() {
-    if (!systemInitialized) {
-        Serial.println("System not ready");
-        return;
-    }
-    
-    Serial.println("=== STARTING CARD EMULATION ===");
-    
-    // TIMING DEBUG: Start measurement
-    startTimingDebug();
-    
-    emulationRequested = true;
-    
-    // BYPASS restartDiscovery() completely - try direct approach
-    // The 5+ second delay is likely in the restart mechanism itself
-    
-    // If discovery is already running, just enable emulation
-    if (discoveryActive) {
-        Serial.println("Discovery active - emulation enabled immediately");
-        return;
-    }
-    
-    // Otherwise, try the minimal restart
-    restartDiscovery();
-}
 
-
-// PHASE 1: Process HID OMNIKEY response - AUTO-TRIGGER VERSION
-void processReaderResponse() {
-    // SAFETY CHECK: Don't process if emulation is active
-    if (emulationRequested || cardActivated) {
-        // Flush buffer to avoid backup
-        while (Serial2.available()) Serial2.read();
-        return;
-    }
-
-    memset(responseBuffer, 0, sizeof(responseBuffer));
-    uint8_t totalBytesReceived = 0;
-
-    // REDUCED delay for safety
-    delay(20); // Reduced from 50ms
-
-    while (Serial2.available() > 0 && totalBytesReceived < sizeof(responseBuffer) - 1) {
-        responseBuffer[totalBytesReceived] = Serial2.read();
-        totalBytesReceived++;
-    }
-
-    if (totalBytesReceived == 0) return;
-
-    if (isErrorResponse(responseBuffer, totalBytesReceived)) {
-        if (isCardPresent) {
-            Serial.println("HID OMNIKEY: Card removed");
-            isCardPresent = false;
-            currentCardUID = "";
-            detectedCardUID = "";
-            autoEmulationTriggered = false;
-        }
-        return;
-    }
-
-    String detectedUID = extractCardUID(responseBuffer, totalBytesReceived);
-
-    if (detectedUID.length() > 0) {
-        if (!isCardPresent || detectedUID != currentCardUID) {
-            Serial.print("HID OMNIKEY: Card detected - UID: ");
-            Serial.println(detectedUID);
-            isCardPresent = true;
-            currentCardUID = detectedUID;
-            detectedCardUID = detectedUID;
-            
-            // PHASE 1: AUTO-TRIGGER EMULATION
-            if (!autoEmulationTriggered && !emulationRequested) {
-                Serial.println("🚀 PHASE 1: Auto-triggering card emulation...");
-                autoEmulationTriggered = true;
-                
-                // Trigger emulation automatically
-                startCardEmulation();
-            }
-        }
-    } else {
-        if (isCardPresent) {
-            Serial.println("HID OMNIKEY: Card removed");
-            isCardPresent = false;
-            currentCardUID = "";
-            detectedCardUID = "";
-            autoEmulationTriggered = false;
-        }
-    }
-}
-const int kPinMISO = 19;
-const int kPinSCK = 18;
-const int kPinSS = 5;
-const int kPinIRQ = -1;    // DISABLED for HID OMNIKEY compatibility
-const int kPinLED = 2;
-
-// Use VSPI peripheral for SPI communication on ESP32
-SPIClass gSPI(VSPI);
-
-// Hardware and NFC Layer
-RfalRfST25R3916Class gReaderHardware(&gSPI, kPinSS, kPinIRQ);
-RfalNfcClass gNFCReader(&gReaderHardware);
-
-// Card Emulation Configuration - OPTIMIZED
-#define DEMO_LM_SEL_RES 0x20U
-#define DEMO_LM_NFCID2_BYTE1 0x02U
-
-// IMPORTANT: Proper initialization arrays
-static uint8_t ceNFCF_nfcid2[] = {DEMO_LM_NFCID2_BYTE1, 0xFE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
-static uint8_t ceNFCA_SENS_RES[] = {0x04, 0x00};  // Changed for better compatibility
-static uint8_t ceNFCA_NFCID[] = {0x08, 'S', 'T', 'M'}; // Custom UID: 08STM (mimic Mifare Classic)
-static uint8_t ceNFCA_SEL_RES = DEMO_LM_SEL_RES;
-
-static uint8_t NFCID3[] = {0x01, 0xFE, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A};
-static uint8_t GB[] = {0x46, 0x66, 0x6d, 0x01, 0x01, 0x11, 0x02, 0x02, 0x07, 0x80, 
-                       0x03, 0x02, 0x00, 0x03, 0x04, 0x01, 0x32, 0x07, 0x01, 0x03};
-
-
-// TIMING DEBUG: This will be called from the library
-// Add this as a global callback function
+// TIMING DEBUG: Callback from library
 void onDeviceStateChange(int newState) {
     if (!timingDebugActive) return;
     
@@ -294,38 +233,11 @@ void onDeviceStateChange(int newState) {
     }
 }
 
-
-
-
-// Performance optimization flags
-bool skipHeartbeat = false;
-unsigned long lastWorkerCall = 0;
-const unsigned long WORKER_INTERVAL = 1; // 1ms for responsive operation
-
-// Helper function to convert RFAL NFC state enum to string
-const char* rfalNfcState2Str(rfalNfcState st) {
-    switch (st) {
-        case RFAL_NFC_STATE_NOTINIT: return "NOTINIT";
-        case RFAL_NFC_STATE_START_DISCOVERY: return "START_DISCOVERY";
-        case RFAL_NFC_STATE_WAKEUP_MODE: return "WAKEUP_MODE";
-        case RFAL_NFC_STATE_POLL_TECHDETECT: return "POLL_TECHDETECT";
-        case RFAL_NFC_STATE_POLL_COLAVOIDANCE: return "POLL_COLAVOIDANCE";
-        case RFAL_NFC_STATE_POLL_SELECT: return "POLL_SELECT";
-        case RFAL_NFC_STATE_POLL_ACTIVATION: return "POLL_ACTIVATION";
-        case RFAL_NFC_STATE_LISTEN_TECHDETECT: return "LISTEN_TECHDETECT";
-        case RFAL_NFC_STATE_LISTEN_COLAVOIDANCE: return "LISTEN_COLAVOIDANCE";
-        case RFAL_NFC_STATE_LISTEN_ACTIVATION: return "LISTEN_ACTIVATION";
-        case RFAL_NFC_STATE_LISTEN_SLEEP: return "LISTEN_SLEEP";
-        case RFAL_NFC_STATE_ACTIVATED: return "ACTIVATED";
-        case RFAL_NFC_STATE_DATAEXCHANGE: return "DATAEXCHANGE";
-        case RFAL_NFC_STATE_DATAEXCHANGE_DONE: return "DATAEXCHANGE_DONE";
-        default: return "UNKNOWN";
-    }
-}
-
-// MANUAL TRIGGER: Stop card emulation
-void stopCardEmulation() {
-    Serial.println("=== STOPPING CARD EMULATION ===");
+// PHASE 2: Auto-stop emulation with cleanup
+void autoStopCardEmulation(String reason) {
+    if (!emulationRequested) return; // Already stopped
+    
+    Serial.printf("🛑 PHASE 2: Auto-stopping card emulation (%s)\n", reason.c_str());
     
     emulationRequested = false;
     
@@ -342,10 +254,147 @@ void stopCardEmulation() {
     discoveryActive = false;
     digitalWrite(kPinLED, LOW);
     
+    // PHASE 2: Reset auto-trigger states for next cycle
+    autoEmulationTriggered = false;
+    cardRemovedDuringEmulation = false;
+    emulationAutoStartTime = 0;
+    
+    Serial.println("🔄 PHASE 2: Ready for next card detection cycle");
+}
+
+// Start card emulation
+void startCardEmulation() {
+    if (!systemInitialized) {
+        Serial.println("System not ready");
+        return;
+    }
+    
+    Serial.println("=== STARTING CARD EMULATION ===");
+    
+    // TIMING DEBUG: Start measurement
+    startTimingDebug();
+    
+    emulationRequested = true;
+    
+    // PHASE 2: Record auto-start time for timeout
+    emulationAutoStartTime = millis();
+    cardRemovedDuringEmulation = false;
+    
+    // If discovery is already running, just enable emulation
+    if (discoveryActive) {
+        Serial.println("Discovery active - emulation enabled immediately");
+        return;
+    }
+    
+    // Otherwise, try the minimal restart
+    restartDiscovery();
+}
+
+// PHASE 2: Enhanced HID OMNIKEY response processing
+void processReaderResponse() {
+    // SAFETY CHECK: Don't process if emulation is active
+    if (emulationRequested || cardActivated) {
+        // Flush buffer to avoid backup
+        while (Serial2.available()) Serial2.read();
+        return;
+    }
+
+    memset(responseBuffer, 0, sizeof(responseBuffer));
+    uint8_t totalBytesReceived = 0;
+
+    delay(20); // Reduced delay for safety
+
+    while (Serial2.available() > 0 && totalBytesReceived < sizeof(responseBuffer) - 1) {
+        responseBuffer[totalBytesReceived] = Serial2.read();
+        totalBytesReceived++;
+    }
+
+    if (totalBytesReceived == 0) return;
+
+    if (isErrorResponse(responseBuffer, totalBytesReceived)) {
+        if (isCardPresent) {
+            Serial.println("HID OMNIKEY: Card removed");
+            isCardPresent = false;
+            currentCardUID = "";
+            detectedCardUID = "";
+            
+            // PHASE 2: Mark card as removed if emulation was running
+            if (autoEmulationTriggered) {
+                cardRemovedDuringEmulation = true;
+                Serial.println("🚨 PHASE 2: Card removed during emulation - will auto-stop");
+            }
+            
+            autoEmulationTriggered = false;
+        }
+        return;
+    }
+
+    String detectedUID = extractCardUID(responseBuffer, totalBytesReceived);
+
+    if (detectedUID.length() > 0) {
+        if (!isCardPresent || detectedUID != currentCardUID) {
+            Serial.print("HID OMNIKEY: Card detected - UID: ");
+            Serial.println(detectedUID);
+            isCardPresent = true;
+            currentCardUID = detectedUID;
+            detectedCardUID = detectedUID;
+            
+            // PHASE 1 & 2: AUTO-TRIGGER EMULATION
+            if (!autoEmulationTriggered && !emulationRequested) {
+                Serial.println("🚀 PHASE 2: Auto-triggering card emulation...");
+                autoEmulationTriggered = true;
+                cardRemovedDuringEmulation = false;
+                
+                // Trigger emulation automatically
+                startCardEmulation();
+            }
+        }
+    } else {
+        if (isCardPresent) {
+            Serial.println("HID OMNIKEY: Card removed");
+            isCardPresent = false;
+            currentCardUID = "";
+            detectedCardUID = "";
+            
+            // PHASE 2: Mark card as removed if emulation was running
+            if (autoEmulationTriggered) {
+                cardRemovedDuringEmulation = true;
+                Serial.println("🚨 PHASE 2: Card removed during emulation - will auto-stop");
+            }
+            
+            autoEmulationTriggered = false;
+        }
+    }
+}
+
+// Stop card emulation (manual)
+void stopCardEmulation() {
+    Serial.println("=== STOPPING CARD EMULATION (MANUAL) ===");
+    
+    emulationRequested = false;
+    
+    // Deactivate current session
+    if (cardActivated || discoveryActive) {
+        ReturnCode deactErr = gNFCReader.rfalNfcDeactivate(false);
+        if (deactErr != ERR_NONE) {
+            Serial.printf("Deactivation warning: %d\n", deactErr);
+        }
+    }
+    
+    // Reset states
+    cardActivated = false;
+    discoveryActive = false;
+    digitalWrite(kPinLED, LOW);
+    
+    // PHASE 2: Reset auto-trigger states
+    autoEmulationTriggered = false;
+    cardRemovedDuringEmulation = false;
+    emulationAutoStartTime = 0;
+    
     Serial.println("Card emulation stopped");
 }
 
-// MANUAL TRIGGER: Process serial commands - PHASE 1 ENHANCED
+// PHASE 2: Enhanced serial command processing
 void processSerialCommand() {
     if (Serial.available()) {
         String command = Serial.readString();
@@ -367,10 +416,20 @@ void processSerialCommand() {
                           isCardPresent ? "YES" : "NO",
                           currentCardUID.c_str(),
                           autoEmulationTriggered ? "YES" : "NO");
+            
+            // PHASE 2: Additional status info
+            if (emulationRequested && emulationAutoStartTime > 0) {
+                unsigned long elapsed = millis() - emulationAutoStartTime;
+                unsigned long remaining = (elapsed < AUTO_STOP_TIMEOUT) ? (AUTO_STOP_TIMEOUT - elapsed) : 0;
+                Serial.printf("Auto-stop: %lu ms remaining, CardRemoved=%s\n", 
+                             remaining, cardRemovedDuringEmulation ? "YES" : "NO");
+            }
         } else if (command == "RESET") {
-            Serial.println("🔄 PHASE 1: Resetting auto-trigger state");
+            Serial.println("🔄 PHASE 2: Resetting auto-trigger state");
             autoEmulationTriggered = false;
             detectedCardUID = "";
+            cardRemovedDuringEmulation = false;
+            emulationAutoStartTime = 0;
             if (emulationRequested) {
                 stopCardEmulation();
             }
@@ -382,14 +441,16 @@ void processSerialCommand() {
             Serial.println("RESET  - Reset auto-trigger state");
             Serial.println("HELP   - Show this help");
             Serial.println("");
-            Serial.println("PHASE 1: Auto-trigger active");
+            Serial.println("PHASE 2: Auto-trigger + Auto-stop active");
             Serial.println("- Tap card to HID OMNIKEY #1");
-            Serial.println("- System will auto-start emulation");
+            Serial.println("- System auto-starts emulation");
+            Serial.println("- Auto-stops after 4s OR card removal");
         } else {
             Serial.println("Unknown command. Type HELP for available commands.");
         }
     }
 }
+
 void resetSystem() {
     Serial.println("=== SYSTEM RESET ===");
     
@@ -402,11 +463,11 @@ void resetSystem() {
     
     // Clean SPI reset
     gSPI.end();
-    delay(200); // Longer delay for proper reset
+    delay(200);
     
     // Reinitialize SPI with proper settings
     gSPI.begin(kPinSCK, kPinMISO, kPinMOSI, kPinSS);
-    gSPI.setFrequency(1000000); // 1MHz for stability
+    gSPI.setFrequency(1000000);
     gSPI.setDataMode(SPI_MODE0);
     gSPI.setBitOrder(MSBFIRST);
     
@@ -417,7 +478,7 @@ void resetSystem() {
     Serial.println("Hardware reset completed");
 }
 
-// OPTIMIZED NFC initialization
+// NFC initialization
 bool initializeNFC() {
     Serial.print("Initializing NFC stack... ");
     
@@ -426,7 +487,6 @@ bool initializeNFC() {
     if (init_err == ERR_NONE) {
         Serial.println("SUCCESS");
         
-        // CRITICAL: Proper card emulation initialization
         Serial.print("Initializing T4T card emulation... ");
         demoCeInit(ceNFCF_nfcid2);
         Serial.println("SUCCESS");
@@ -449,11 +509,11 @@ bool initializeNFC() {
     }
 }
 
-// OPTIMIZED data exchange with better error handling
+// Data exchange with error handling
 ReturnCode demoTransceiveBlocking(uint8_t* txBuf, uint16_t txBufSize, uint8_t** rxData, uint16_t** rcvLen, uint32_t fwt) {
     ReturnCode err;
     uint32_t startTime = millis();
-    const uint32_t EXCHANGE_TIMEOUT = 2000; // 2 second timeout for gate application
+    const uint32_t EXCHANGE_TIMEOUT = 2000;
     
     err = gNFCReader.rfalNfcDataExchangeStart(txBuf, txBufSize, rxData, rcvLen, fwt);
     
@@ -478,14 +538,11 @@ ReturnCode demoTransceiveBlocking(uint8_t* txBuf, uint16_t txBufSize, uint8_t** 
     return err;
 }
 
-// RADICAL FIX: Minimal discovery restart - ATTACK THE 5+ SECOND DELAY
+// Minimal discovery restart
 void restartDiscovery() {
     if (!systemInitialized) {
         return;
     }
-    
-    // COMPLETELY SKIP deactivation - this is likely the 5+ second culprit
-    // NO state waiting, NO delays, NO complex checks
     
     // Immediate parameter setup
     rfalNfcDiscoverParam discover_params;
@@ -495,7 +552,7 @@ void restartDiscovery() {
     discover_params.compMode = RFAL_COMPLIANCE_MODE_NFC;
     discover_params.devLimit = 1;
     discover_params.techs2Find = RFAL_NFC_LISTEN_TECH_A;
-    discover_params.totalDuration = 100U; // MINIMAL duration
+    discover_params.totalDuration = 100U;
     discover_params.wakeupEnabled = false;
     
     // Essential Listen Mode Configuration only
@@ -505,12 +562,12 @@ void restartDiscovery() {
     discover_params.lmConfigPA.SEL_RES = ceNFCA_SEL_RES;
     discover_params.notifyCb = demoNotif;
     
-    // IMMEDIATE start - no error checking that could delay
+    // Immediate start
     gNFCReader.rfalNfcDiscover(&discover_params);
     discoveryActive = true;
 }
 
-// ENHANCED notification callback with READER DETECTION
+// Enhanced notification callback
 void demoNotif(rfalNfcState st) {
     static rfalNfcState lastState = RFAL_NFC_STATE_NOTINIT;
     
@@ -557,7 +614,6 @@ void demoNotif(rfalNfcState st) {
             
         case RFAL_NFC_STATE_LISTEN_TECHDETECT:
             if (emulationRequested) {
-                // Card emulation is active and waiting for reader
                 discoveryActive = true;
             }
             break;
@@ -577,12 +633,11 @@ void demoNotif(rfalNfcState st) {
             break;
             
         default:
-            // Handle other states silently
             break;
     }
 }
 
-// OPTIMIZED data exchange handler
+// Data exchange handler
 void handleDataExchange() {
     ReturnCode err;
     uint8_t* rxData;
@@ -624,8 +679,8 @@ void setup() {
     while (!Serial) delay(10);
     
     Serial.println("========================================");
-    Serial.println("ESP32 ST25R3916 Card Emulation v2.2");
-    Serial.println("PHASE 1: AUTO-TRIGGER IMPLEMENTATION");
+    Serial.println("ESP32 ST25R3916 Card Emulation v2.3");
+    Serial.println("PHASE 2: AUTO-TRIGGER + AUTO-STOP");
     Serial.println("========================================");
     
     // Print configuration
@@ -648,7 +703,7 @@ void setup() {
     
     Serial.println("SPI initialized");
     
-    // PHASE 1: Initialize Serial2 for HID OMNIKEY
+    // Initialize Serial2 for HID OMNIKEY
     Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
     Serial.println("Serial2 initialized for HID OMNIKEY");
     
@@ -667,22 +722,25 @@ void setup() {
     restartDiscovery();
     
     Serial.println("========================================");
-    Serial.println("PHASE 1 READY - AUTO-TRIGGER ACTIVE");
+    Serial.println("PHASE 2 READY - AUTO-TRIGGER + AUTO-STOP");
     Serial.println("");
-    Serial.println("🎯 WORKFLOW:");
+    Serial.println("🎯 COMPLETE WORKFLOW:");
     Serial.println("1. Tap card to HID OMNIKEY #1");
-    Serial.println("2. System detects UID");
-    Serial.println("3. Auto-starts card emulation");
-    Serial.println("4. HID OMNIKEY #2 can read ST25R3916");
+    Serial.println("2. System detects UID → Auto-starts emulation");
+    Serial.println("3. HID OMNIKEY #2 can read ST25R3916 (~1.17s)");
+    Serial.println("4. Auto-stops after 4s OR card removal");
+    Serial.println("5. Ready for next card cycle");
     Serial.println("");
     Serial.println("📱 Manual Commands:");
     Serial.println("R - Manual start  |  S - Stop  |  HELP - Commands");
     Serial.println("========================================");
     
-    // Initialize Phase 1 variables
+    // Initialize Phase 2 variables
     emulationRequested = false;
     autoEmulationTriggered = false;
     detectedCardUID = "";
+    cardRemovedDuringEmulation = false;
+    emulationAutoStartTime = 0;
 }
 
 void loop() {
@@ -693,7 +751,19 @@ void loop() {
     // Process serial commands
     processSerialCommand();
     
-    // STEP 2: HID OMNIKEY Card Reading - ONLY when emulation is IDLE
+    // PHASE 2: Auto-stop logic checks
+    if (emulationRequested && emulationAutoStartTime > 0) {
+        // Check for 4-second timeout
+        if (currentTime - emulationAutoStartTime >= AUTO_STOP_TIMEOUT) {
+            autoStopCardEmulation("4-second timeout");
+        }
+        // Check for card removal during emulation
+        else if (cardRemovedDuringEmulation) {
+            autoStopCardEmulation("card removed");
+        }
+    }
+    
+    // HID OMNIKEY Card Reading - ONLY when emulation is IDLE
     if (cardReadingEnabled && !emulationRequested && !cardActivated) {
         // Send card read command at intervals
         if (currentTime - lastPollTime >= POLL_INTERVAL) {
@@ -717,6 +787,14 @@ void loop() {
                       emulationRequested ? "ACTIVE" : "IDLE",
                       cardActivated ? "CONNECTED" : "STANDBY",
                       (cardReadingEnabled && !emulationRequested) ? "POLLING" : "PAUSED");
+        
+        // PHASE 2: Show auto-stop status
+        if (emulationRequested && emulationAutoStartTime > 0) {
+            unsigned long elapsed = currentTime - emulationAutoStartTime;
+            unsigned long remaining = (elapsed < AUTO_STOP_TIMEOUT) ? (AUTO_STOP_TIMEOUT - elapsed) : 0;
+            Serial.printf("Auto-stop: %lu ms remaining\n", remaining);
+        }
+        
         lastHeartbeat = currentTime;
     }
     
