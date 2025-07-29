@@ -74,15 +74,21 @@ byte responseBuffer[128];
 bool isCardPresent = false;
 String currentCardUID = "";
 unsigned long lastPollTime = 0;
-const unsigned long POLL_INTERVAL = 500;
+const unsigned long POLL_INTERVAL = 300; // PHASE 2.5: Reduced to 300ms for better card removal detection
 bool cardReadingEnabled = true;
 
-// PHASE 2: Auto-Stop Logic Variables
+// PHASE 2.5: Auto-Stop Logic Variables
 String detectedCardUID = "";
 bool autoEmulationTriggered = false;
 const unsigned long AUTO_STOP_TIMEOUT = 4000; // 4 seconds auto-stop
 unsigned long emulationAutoStartTime = 0;
 bool cardRemovedDuringEmulation = false;
+unsigned long lastCardPresentTime = 0; // PHASE 2.5: Track last time card was present
+const unsigned long CARD_REMOVAL_TIMEOUT = 1000; // PHASE 2.5: 1 second without card = removed
+
+// PHASE 2.5: Dynamic UID Emulation Variables
+static uint8_t dynamicNFCID[RFAL_LM_NFCID_LEN_04] = {0x08, 'S', 'T', 'M'}; // Default fallback
+bool uidUpdateRequired = false;
 
 // TIMING DEBUG Variables
 unsigned long emulationStartTime = 0;
@@ -164,6 +170,76 @@ bool isErrorResponse(byte *data, int dataLength) {
     return true;
 }
 
+// PHASE 2.5: Convert hex string UID to byte array for NFC emulation
+bool convertUIDStringToBytes(String uidString, uint8_t* uidBytes, int maxLen) {
+    // Remove any spaces and ensure uppercase
+    uidString.trim();
+    uidString.toUpperCase();
+    
+    // Check if length is valid (must be even number of hex chars)
+    if (uidString.length() % 2 != 0 || uidString.length() == 0) {
+        Serial.printf("Invalid UID length: %d\n", uidString.length());
+        return false;
+    }
+    
+    int byteCount = uidString.length() / 2;
+    
+    // PHASE 2.5 FIX: Handle UIDs longer than maxLen by taking first bytes
+    if (byteCount > maxLen) {
+        Serial.printf("⚠️  UID is %d bytes, truncating to first %d bytes\n", byteCount, maxLen);
+        byteCount = maxLen; // Use only first maxLen bytes
+    }
+    
+    // Convert hex string to bytes
+    for (int i = 0; i < byteCount; i++) {
+        String hexByte = uidString.substring(i * 2, i * 2 + 2);
+        char* endPtr;
+        long value = strtol(hexByte.c_str(), &endPtr, 16);
+        
+        if (*endPtr != '\0') {
+            Serial.printf("Invalid hex byte: %s\n", hexByte.c_str());
+            return false;
+        }
+        
+        uidBytes[i] = (uint8_t)value;
+    }
+    
+    // Fill remaining bytes with 0 if UID is shorter than maxLen
+    for (int i = byteCount; i < maxLen; i++) {
+        uidBytes[i] = 0x00;
+    }
+    
+    Serial.printf("✅ UID converted: %s → ", uidString.c_str());
+    for (int i = 0; i < maxLen; i++) {
+        Serial.printf("%02X ", uidBytes[i]);
+    }
+    Serial.printf("(using first %d bytes)\n", maxLen);
+    
+    return true;
+}
+
+// PHASE 2.5: Update NFC emulation UID with detected card UID
+void updateEmulationUID(String detectedUID) {
+    if (detectedUID.length() == 0) {
+        Serial.println("⚠️  Empty UID - using default");
+        return;
+    }
+    
+    Serial.printf("🔄 PHASE 2.5: Updating emulation UID to %s\n", detectedUID.c_str());
+    
+    if (convertUIDStringToBytes(detectedUID, dynamicNFCID, RFAL_LM_NFCID_LEN_04)) {
+        uidUpdateRequired = true;
+        Serial.println("✅ PHASE 2.5: UID update prepared");
+    } else {
+        Serial.println("❌ PHASE 2.5: UID conversion failed - using default");
+        // Keep default UID
+        dynamicNFCID[0] = 0x08;
+        dynamicNFCID[1] = 'S';
+        dynamicNFCID[2] = 'T';
+        dynamicNFCID[3] = 'M';
+        uidUpdateRequired = true;
+    }
+}
 // TIMING DEBUG: Start timing measurement
 void startTimingDebug() {
     emulationStartTime = millis();
@@ -290,8 +366,10 @@ void startCardEmulation() {
     restartDiscovery();
 }
 
-// PHASE 2: Enhanced HID OMNIKEY response processing
+// PHASE 2.5: Enhanced HID OMNIKEY response processing
 void processReaderResponse() {
+    unsigned long currentTime = millis();
+    
     // SAFETY CHECK: Don't process if emulation is active
     if (emulationRequested || cardActivated) {
         // Flush buffer to avoid backup
@@ -302,26 +380,43 @@ void processReaderResponse() {
     memset(responseBuffer, 0, sizeof(responseBuffer));
     uint8_t totalBytesReceived = 0;
 
-    delay(20); // Reduced delay for safety
+    delay(15); // PHASE 2.5: Reduced delay for faster response
 
     while (Serial2.available() > 0 && totalBytesReceived < sizeof(responseBuffer) - 1) {
         responseBuffer[totalBytesReceived] = Serial2.read();
         totalBytesReceived++;
     }
 
-    if (totalBytesReceived == 0) return;
-
-    if (isErrorResponse(responseBuffer, totalBytesReceived)) {
-        if (isCardPresent) {
-            Serial.println("HID OMNIKEY: Card removed");
+    if (totalBytesReceived == 0) {
+        // PHASE 2.5: Check for card removal timeout
+        if (isCardPresent && (currentTime - lastCardPresentTime > CARD_REMOVAL_TIMEOUT)) {
+            Serial.println("🚨 PHASE 2.5: Card removal detected (timeout)");
             isCardPresent = false;
             currentCardUID = "";
             detectedCardUID = "";
             
-            // PHASE 2: Mark card as removed if emulation was running
-            if (autoEmulationTriggered) {
+            // PHASE 2.5 FIX: Properly mark card as removed if emulation was running  
+            if (autoEmulationTriggered && emulationRequested) {
                 cardRemovedDuringEmulation = true;
-                Serial.println("🚨 PHASE 2: Card removed during emulation - will auto-stop");
+                Serial.println("🛑 PHASE 2.5 FIX: Card removed during emulation - will auto-stop");
+            }
+            
+            autoEmulationTriggered = false;
+        }
+        return;
+    }
+
+    if (isErrorResponse(responseBuffer, totalBytesReceived)) {
+        if (isCardPresent) {
+            Serial.println("HID OMNIKEY: Card removed (error response)");
+            isCardPresent = false;
+            currentCardUID = "";
+            detectedCardUID = "";
+            
+            // PHASE 2.5 FIX: Properly mark card as removed if emulation was running
+            if (autoEmulationTriggered && emulationRequested) {
+                cardRemovedDuringEmulation = true;
+                Serial.println("🛑 PHASE 2.5 FIX: Card removed during emulation - will auto-stop");
             }
             
             autoEmulationTriggered = false;
@@ -332,6 +427,9 @@ void processReaderResponse() {
     String detectedUID = extractCardUID(responseBuffer, totalBytesReceived);
 
     if (detectedUID.length() > 0) {
+        // PHASE 2.5: Update last card present time
+        lastCardPresentTime = currentTime;
+        
         if (!isCardPresent || detectedUID != currentCardUID) {
             Serial.print("HID OMNIKEY: Card detected - UID: ");
             Serial.println(detectedUID);
@@ -339,9 +437,12 @@ void processReaderResponse() {
             currentCardUID = detectedUID;
             detectedCardUID = detectedUID;
             
-            // PHASE 1 & 2: AUTO-TRIGGER EMULATION
+            // PHASE 2.5: Update emulation UID with detected card UID
+            updateEmulationUID(detectedUID);
+            
+            // AUTO-TRIGGER EMULATION
             if (!autoEmulationTriggered && !emulationRequested) {
-                Serial.println("🚀 PHASE 2: Auto-triggering card emulation...");
+                Serial.println("🚀 PHASE 2.5: Auto-triggering card emulation with dynamic UID...");
                 autoEmulationTriggered = true;
                 cardRemovedDuringEmulation = false;
                 
@@ -350,20 +451,8 @@ void processReaderResponse() {
             }
         }
     } else {
-        if (isCardPresent) {
-            Serial.println("HID OMNIKEY: Card removed");
-            isCardPresent = false;
-            currentCardUID = "";
-            detectedCardUID = "";
-            
-            // PHASE 2: Mark card as removed if emulation was running
-            if (autoEmulationTriggered) {
-                cardRemovedDuringEmulation = true;
-                Serial.println("🚨 PHASE 2: Card removed during emulation - will auto-stop");
-            }
-            
-            autoEmulationTriggered = false;
-        }
+        // PHASE 2.5: No valid UID but card might still be there - don't immediately mark as removed
+        // Let the timeout mechanism handle removal detection
     }
 }
 
@@ -538,7 +627,7 @@ ReturnCode demoTransceiveBlocking(uint8_t* txBuf, uint16_t txBufSize, uint8_t** 
     return err;
 }
 
-// Minimal discovery restart
+// PHASE 2.5: Enhanced discovery restart with dynamic UID
 void restartDiscovery() {
     if (!systemInitialized) {
         return;
@@ -555,9 +644,28 @@ void restartDiscovery() {
     discover_params.totalDuration = 100U;
     discover_params.wakeupEnabled = false;
     
-    // Essential Listen Mode Configuration only
+    // PHASE 2.5: Use dynamic UID if available
+    if (uidUpdateRequired) {
+        Serial.println("🔄 PHASE 2.5: Applying dynamic UID to discovery parameters");
+        ST_MEMCPY(&discover_params.lmConfigPA.nfcid, dynamicNFCID, RFAL_LM_NFCID_LEN_04);
+        
+        // Debug: Show what UID is being used
+        Serial.printf("📡 Emulating UID: ");
+        for (int i = 0; i < RFAL_LM_NFCID_LEN_04; i++) {
+            Serial.printf("%02X ", dynamicNFCID[i]);
+        }
+        Serial.println();
+        
+        uidUpdateRequired = false; // Reset flag
+    } else {
+        // Use default static UID
+        static uint8_t defaultNFCID[] = {0x08, 'S', 'T', 'M'};
+        ST_MEMCPY(&discover_params.lmConfigPA.nfcid, defaultNFCID, RFAL_LM_NFCID_LEN_04);
+        Serial.println("📡 Using default UID: 08 53 54 4D");
+    }
+    
+    // Essential Listen Mode Configuration
     ST_MEMCPY(&discover_params.lmConfigPA.SENS_RES, ceNFCA_SENS_RES, RFAL_LM_SENS_RES_LEN);
-    ST_MEMCPY(&discover_params.lmConfigPA.nfcid, ceNFCA_NFCID, RFAL_LM_NFCID_LEN_04);
     discover_params.lmConfigPA.nfcidLen = RFAL_LM_NFCID_LEN_04;
     discover_params.lmConfigPA.SEL_RES = ceNFCA_SEL_RES;
     discover_params.notifyCb = demoNotif;
@@ -679,8 +787,8 @@ void setup() {
     while (!Serial) delay(10);
     
     Serial.println("========================================");
-    Serial.println("ESP32 ST25R3916 Card Emulation v2.3");
-    Serial.println("PHASE 2: AUTO-TRIGGER + AUTO-STOP");
+    Serial.println("ESP32 ST25R3916 Card Emulation v2.5");
+    Serial.println("PHASE 2.5: BUG FIXES - UID + REMOVAL");
     Serial.println("========================================");
     
     // Print configuration
@@ -722,25 +830,35 @@ void setup() {
     restartDiscovery();
     
     Serial.println("========================================");
-    Serial.println("PHASE 2 READY - AUTO-TRIGGER + AUTO-STOP");
+    Serial.println("PHASE 2.5 READY - BUG FIXES APPLIED");
     Serial.println("");
     Serial.println("🎯 COMPLETE WORKFLOW:");
     Serial.println("1. Tap card to HID OMNIKEY #1");
-    Serial.println("2. System detects UID → Auto-starts emulation");
-    Serial.println("3. HID OMNIKEY #2 can read ST25R3916 (~1.17s)");
-    Serial.println("4. Auto-stops after 4s OR card removal");
-    Serial.println("5. Ready for next card cycle");
+    Serial.println("2. System detects UID → Uses first 4 bytes");
+    Serial.println("3. Auto-starts emulation with truncated UID");
+    Serial.println("4. HID OMNIKEY #2 reads first 4 bytes of UID");
+    Serial.println("5. Auto-stops after 4s OR card removal");
+    Serial.println("6. Ready for next card cycle");
+    Serial.println("");
+    Serial.println("🔧 BUG FIXES:");
+    Serial.println("✅ Handle 7-byte UID → truncate to 4 bytes");
+    Serial.println("✅ Fixed card removal detection logic");
+    Serial.println("✅ Better emulation state checking");
+    Serial.println("");
+    Serial.println("Example: 04184F0AE16E80 → 04184F0A (first 4 bytes)");
     Serial.println("");
     Serial.println("📱 Manual Commands:");
     Serial.println("R - Manual start  |  S - Stop  |  HELP - Commands");
     Serial.println("========================================");
     
-    // Initialize Phase 2 variables
+    // Initialize Phase 2.5 variables
     emulationRequested = false;
     autoEmulationTriggered = false;
     detectedCardUID = "";
     cardRemovedDuringEmulation = false;
     emulationAutoStartTime = 0;
+    uidUpdateRequired = false;
+    lastCardPresentTime = millis();
 }
 
 void loop() {
