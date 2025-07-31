@@ -49,7 +49,7 @@ const int kPinMOSI = 23;
 const int kPinMISO = 19;
 const int kPinSCK = 18;
 const int kPinSS = 5;
-const int kPinIRQ = -1;
+const int kPinIRQ = 4;
 const int kPinLED = 2;
 
 SPIClass gSPI(VSPI);
@@ -80,6 +80,8 @@ static uint8_t dynamicNFCID[RFAL_LM_NFCID_LEN_04] = {0xA8, 'S', 'T', 'M'};
 bool uidUpdateRequired = false;
 
 // Timing debug
+unsigned long startTimeEmu = 0;
+unsigned long endTimeEmu = 0;
 unsigned long emulationStartTime = 0;
 unsigned long state2AchievedTime = 0;
 bool timingDebugActive = false;
@@ -87,7 +89,7 @@ int lastDeviceState = -1;
 bool state2Detected = false;
 int state2Count = 0;
 const int STATE2_TARGET_COUNT = 10;
-
+unsigned long currentTime = 0;
 bool skipHeartbeat = false;
 unsigned long lastWorkerCall = 0;
 const unsigned long WORKER_INTERVAL = 1;
@@ -898,10 +900,38 @@ void restartDiscovery()
     rfalNfcDiscoverParam discover_params;
     memset(&discover_params, 0, sizeof(discover_params));
 
-    discover_params.compMode = RFAL_COMPLIANCE_MODE_NFC;
+    unsigned long lastIRQTime = 0;
+    unsigned int irqSpamCount = 0;
+    const unsigned long IRQ_RATE_LIMIT = 50; // ms between processing
+
+    // Modify worker call in loop() (REPLACE existing worker call):
+    if (emulationRequested && currentTime - lastWorkerCall >= WORKER_INTERVAL)
+    {
+        // Rate limit worker calls during spam
+        if (currentTime - lastIRQTime > IRQ_RATE_LIMIT)
+        {
+            gNFCReader.rfalNfcWorker();
+            lastWorkerCall = currentTime;
+            lastIRQTime = currentTime;
+            irqSpamCount = 0;
+        }
+        else
+        {
+            irqSpamCount++;
+            if (irqSpamCount > 10)
+            {
+                // Skip worker during heavy spam
+                delay(10);
+                irqSpamCount = 0;
+            }
+        }
+    }
+
+    // OPTIMIZED: Faster discovery parameters
+    discover_params.compMode = RFAL_COMPLIANCE_MODE_ISO; // Try EMV mode
     discover_params.devLimit = 1;
     discover_params.techs2Find = RFAL_NFC_LISTEN_TECH_A;
-    discover_params.totalDuration = 100U;
+    discover_params.totalDuration = 25U; // REDUCED from 100U for faster response
     discover_params.wakeupEnabled = false;
 
     // Use current UID (either default or updated)
@@ -921,17 +951,38 @@ void restartDiscovery()
 
     ReturnCode result = gNFCReader.rfalNfcDiscover(&discover_params);
     discoveryActive = true;
+
+    // ADD: Debug discovery result
+    Serial.printf("🔍 Discovery result: %d\n", result);
 }
 
 void demoNotif(rfalNfcState st)
 {
     static rfalNfcState lastState = RFAL_NFC_STATE_NOTINIT;
-    Serial.print("INI STATE> ");
-    Serial.println(st);
+    static unsigned long lastWaitingLog = 0;
+    unsigned long currentTime = millis();
+
+    // ONLY log state changes, bukan spam
     if (st != lastState)
     {
-        Serial.printf("STATE: %s -> %s\n", rfalNfcState2Str(lastState), rfalNfcState2Str(st));
+        // Reduce verbose logging untuk active states
+        if (st == RFAL_NFC_STATE_START_DISCOVERY)
+        {
+            Serial.println("*** WAITING FOR READER ***");
+        }
+        else
+        {
+            Serial.printf("STATE: %s -> %s\n", rfalNfcState2Str(lastState), rfalNfcState2Str(st));
+        }
         lastState = st;
+    }
+
+    // Limit *** WAITING FOR READER *** spam to every 2 seconds
+    if (st == RFAL_NFC_STATE_START_DISCOVERY &&
+        currentTime - lastWaitingLog > 2000)
+    {
+        // Don't spam - just update timestamp
+        lastWaitingLog = currentTime;
     }
 
     lastActivity = millis();
@@ -941,6 +992,11 @@ void demoNotif(rfalNfcState st)
     case RFAL_NFC_STATE_ACTIVATED:
         if (emulationRequested)
         {
+            endTimeEmu = millis();
+            float durationSeconds = (endTimeEmu - startTimeEmu) / 1000.0;
+            Serial.print("Timer stopped. Duration: ");
+            Serial.print(durationSeconds);
+            Serial.println(" seconds");
             Serial.println("*** READER CONNECTED ***");
             digitalWrite(kPinLED, HIGH);
             cardActivated = true;
@@ -953,17 +1009,6 @@ void demoNotif(rfalNfcState st)
         {
             Serial.println("*** DATA EXCHANGE ***");
             handleDataExchange();
-        }
-        break;
-
-    case RFAL_NFC_STATE_START_DISCOVERY:
-        if (emulationRequested)
-        {
-            Serial.println("*** WAITING FOR READER ***");
-            digitalWrite(kPinLED, LOW);
-            cardActivated = false;
-            discoveryActive = true;
-            skipHeartbeat = true;
         }
         break;
 
@@ -996,6 +1041,7 @@ void demoNotif(rfalNfcState st)
 
 void handleDataExchange()
 {
+    Serial.println("🔄 handleDataExchange() CALLED!");
     ReturnCode err;
     uint8_t *rxData;
     uint16_t *rcvLen;
@@ -1097,7 +1143,7 @@ void loop()
 
     static unsigned long lastHeartbeat = 0;
     static unsigned long lastRestartCheck = 0;
-    unsigned long currentTime = millis();
+ currentTime = millis();
 
     processSerialCommand();
 
@@ -1170,11 +1216,13 @@ void loop()
     {
         Serial.println("👋 --- CARD REMOVED ---\n");
         stopCardEmulation();
+
         return;
     }
 
     if (isSameData(RESPONSE_CARD_DETECTED))
     {
+        startTimeEmu = millis();
         Serial.println("📱 --- CARD DETECHTED---");
         delay(100);
 

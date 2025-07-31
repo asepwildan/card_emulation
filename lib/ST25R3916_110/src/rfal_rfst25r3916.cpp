@@ -3370,8 +3370,8 @@ ReturnCode RfalRfST25R3916Class::rfalRunListenModeWorker(void)
     return ERR_WRONG_STATE;
   }
 
-  Serial.print("DEVICE STATE: ");
-  Serial.println(gRFAL.Lm.state);
+  // Serial.print("DEVICE STATE: ");
+  // Serial.println(gRFAL.Lm.state);
 
   extern void onDeviceStateChange(int newState);
 onDeviceStateChange(gRFAL.Lm.state);
