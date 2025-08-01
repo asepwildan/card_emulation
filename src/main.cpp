@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "wifi_manager.h"
+#include "server_validation.h"
 #include <rfal_nfc.h>
 #include <rfal_nfca.h>
 #include <rfal_nfcb.h>
@@ -407,6 +408,13 @@ bool processMifareData(uint8_t bufferLength)
     }
 
     Serial.printf("🔄 Converting CSN to UID string: %s\n", uidString.c_str());
+    bool granted = validateCSN(uidString);
+
+    if (!granted)
+    {
+        Serial.println("🚫 ===== VALIDATION FAILED - EMULATION REJECTED =====");
+        return false;
+    }
 
     bool uidUpdated = updateEmulationUID(uidString);
     if (uidUpdated)
@@ -500,7 +508,7 @@ void autoReadCard()
     bool success = false;
 
     // STEP 1: Try reading as SEOS first
-    success = tryReadSEOS();
+    // success = tryReadSEOS();
 
     // STEP 2: If failed, try as Mifare Classic
     if (!success)
@@ -515,9 +523,8 @@ void autoReadCard()
     {
         Serial.println("⚠️ CARD NOT RECOGNIZED or FAILED TO READ");
         Serial.println("   Possible causes:");
-        Serial.println("   - Unsupported card");
-        Serial.println("   - Damaged card");
         Serial.println("   - Connection issue");
+        Serial.println("   - validation fail");
     }
 
     Serial.println("🤖 ===== AUTOMATIC DETECTION COMPLETE =====\n");
@@ -1232,6 +1239,6 @@ void loop()
     }
 
     // ====== WIFI MONITORING ======
-    checkWiFiConnection(); 
+    checkWiFiConnection();
     yield();
 }
