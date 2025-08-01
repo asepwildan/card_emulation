@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include "wifi_manager.h"
 #include <rfal_nfc.h>
 #include <rfal_nfca.h>
 #include <rfal_nfcb.h>
@@ -1087,6 +1088,7 @@ void setup()
     Serial.begin(115200);
     while (!Serial)
         delay(10);
+    initWiFi();
     Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
     Serial.println("========================================");
     Serial.println("ESP32 ST25R3916 Card Emulation Only");
@@ -1143,7 +1145,7 @@ void loop()
 
     static unsigned long lastHeartbeat = 0;
     static unsigned long lastRestartCheck = 0;
- currentTime = millis();
+    currentTime = millis();
 
     processSerialCommand();
 
@@ -1228,5 +1230,8 @@ void loop()
 
         autoReadCard();
     }
+
+    // ====== WIFI MONITORING ======
+    checkWiFiConnection(); 
     yield();
 }
